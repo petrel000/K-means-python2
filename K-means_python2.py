@@ -1,0 +1,340 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_score
+import matplotlib.pyplot as plt
+
+# 全局配置
+import os
+import urllib.request
+from matplotlib import font_manager
+
+# 下载中文字体到临时目录（Streamlit Cloud 有网络权限）
+font_url = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf"
+font_path = "/tmp/NotoSansCJKsc-Regular.otf"
+
+if not os.path.exists(font_path):
+    try:
+        urllib.request.urlretrieve(font_url, font_path)
+        font_manager.fontManager.addfont(font_path)
+    except Exception:
+        pass  # 如果下载失败，使用备用字体
+
+plt.rcParams['font.sans-serif'] = ['Noto Sans CJK SC', 'DejaVu Sans', 'Liberation Sans', 'sans-serif']
+plt.rcParams['axes.unicode_minus'] = False
+st.set_page_config(
+    page_title="患者心血管风险分群评估系统",
+    page_icon="🏥",
+    layout="wide"
+)
+
+# 初始化会话状态，保存关键参数
+if 'k_selected' not in st.session_state:
+    st.session_state.k_selected = 3
+if 'model' not in st.session_state:
+    st.session_state.model = None
+if 'scaler' not in st.session_state:
+    st.session_state.scaler = None
+if 'selected_features' not in st.session_state:
+    st.session_state.selected_features = []
+if 'df_result' not in st.session_state:
+    st.session_state.df_result = None
+
+# 标题与说明
+st.title("🏥 患者心血管风险分群评估系统")
+st.markdown("基于K-Means无监督学习的心血管疾病与代谢综合征风险筛查")
+
+# 侧边栏配置
+st.sidebar.header("📁 数据上传")
+uploaded_file = st.sidebar.file_uploader("上传患者数据(CSV)", type=['csv'])
+
+st.sidebar.header("⚙️ 参数设置")
+k_value = st.sidebar.slider("聚类数量 K", 2, 10, st.session_state.k_selected)
+auto_k = st.sidebar.checkbox("自动选择最佳K值", value=False)  # 默认关闭自动选K，避免覆盖手动设置
+
+# 数据加载与验证
+if uploaded_file is not None:
+    df = pd.read_csv(uploaded_file)
+    st.write("### 数据预览")
+    st.write(df.head())
+
+    # 特征列定义与验证
+    feature_cols = ['age', 'systolic_bp', 'diastolic_bp', 'heart_rate', 'blood_sugar', 'bmi', 'cholesterol']
+    available_features = [f for f in feature_cols if f in df.columns]
+
+    if len(available_features) < 2:
+        st.error("数据列名不匹配！需要包含至少2个以下列：age, systolic_bp, diastolic_bp, heart_rate, blood_sugar, bmi, cholesterol")
+    else:
+        # 特征选择（关联会话状态）
+        st.session_state.selected_features = st.sidebar.multiselect(
+            "选择用于聚类的特征",
+            available_features,
+            default=st.session_state.selected_features if st.session_state.selected_features else available_features[:4]
+        )
+
+        # 分析按钮逻辑
+        if st.sidebar.button("🚀 开始分析"):
+            with st.spinner("分析中..."):
+                # 1. 数据预处理
+                X = df[st.session_state.selected_features]
+                scaler = StandardScaler()
+                X_scaled = scaler.fit_transform(X)
+                st.session_state.scaler = scaler  # 保存标准化器到会话状态
+
+                # 2. K值选择逻辑（优先手动，自动为辅）
+                if auto_k:
+                    best_k, best_score = 2, -1
+                    # 自动选K范围：2到10（与滑块范围一致）
+                    for k_candidate in range(2, 11):
+                        km = KMeans(n_clusters=k_candidate, random_state=42, n_init=10)
+                        labels = km.fit_predict(X_scaled)
+                        score = silhouette_score(X_scaled, labels)
+                        if score > best_score:
+                            best_k, best_score = k_candidate, score
+                    final_k = best_k
+                    st.info(f"自动选择最佳K值：K = {final_k}（轮廓系数：{best_score:.3f}）")
+                else:
+                    final_k = k_value
+                    st.info(f"使用手动设置K值：K = {final_k}")
+
+                # 更新会话状态的K值
+                st.session_state.k_selected = final_k
+
+                # 3. K-Means聚类
+                kmeans = KMeans(n_clusters=final_k, random_state=42, n_init=10)
+                df['cluster'] = kmeans.fit_predict(X_scaled)
+                st.session_state.model = kmeans  # 保存模型到会话状态
+
+                # 4. 群体特征描述函数（BMI分级判断）
+                def describe_cluster(cid):
+                    center = kmeans.cluster_centers_[cid]
+                    center_original = scaler.inverse_transform([center])[0]
+                    features = []
+                    feat_thresholds = {
+                        'age': (60, '高龄'),
+                        'systolic_bp': (140, '收缩压偏高'),
+                        'diastolic_bp': (90, '舒张压偏高'),
+                        'blood_sugar': (126, '血糖偏高'),
+                        'cholesterol': (240, '胆固醇偏高'),
+                        'heart_rate': (100, '心率偏快')
+                    }
+                    for i, feat in enumerate(st.session_state.selected_features):
+                        val = center_original[i]
+                        if feat == 'bmi':
+                            if val >= 29:
+                                features.append('肥胖')
+                            elif val >= 25:
+                                features.append('超重')
+                        elif feat in feat_thresholds and val >= feat_thresholds[feat][0]:
+                            features.append(feat_thresholds[feat][1])
+                    return "、".join(features) + "群体" if features else "指标正常群体"
+
+                # 5. 风险等级评估（优化评分逻辑）
+                def assess_risk(cid):
+                    # 基于聚类中心与阈值的偏离程度计算风险
+                    center = kmeans.cluster_centers_[cid]
+                    # 计算标准化后中心的均值（正值越大风险越高）
+                    risk_score = np.mean(center)
+                    if risk_score > 0.5:
+                        return '高风险'
+                    elif risk_score > -0.3:
+                        return '中风险'
+                    else:
+                        return '低风险'
+
+                # 6. 生成结果数据
+                df['cluster_type'] = df['cluster'].apply(describe_cluster)
+                df['risk_level'] = df['cluster'].apply(assess_risk)
+                st.session_state.df_result = df  # 保存结果到会话状态
+
+                # 7. PCA降维可视化
+                pca = PCA(n_components=2)
+                X_pca = pca.fit_transform(X_scaled)
+                df['pca1'] = X_pca[:, 0]
+                df['pca2'] = X_pca[:, 1]
+
+                # 8. 展示群体统计
+                st.write("### 📊 各群体统计特征")
+                cluster_stats = []
+                for c in range(final_k):
+                    group = df[df['cluster'] == c]
+                    stats = {
+                        '群体ID': c + 1,  # 从1开始计数
+                        '群体特征': describe_cluster(c),
+                        '风险等级': assess_risk(c),
+                        '人数': len(group),
+                        '占比': f"{len(group)/len(df)*100:.1f}%",
+                        **{f'平均{feat}': round(group[feat].mean(), 1) if feat in group.columns else '-' 
+                           for feat in st.session_state.selected_features}
+                    }
+                    cluster_stats.append(stats)
+                st.table(pd.DataFrame(cluster_stats))
+
+                # 9. PCA可视化
+                st.write("### 📈 PCA降维聚类视图")
+                fig, ax = plt.subplots(figsize=(12, 7))
+                colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E9']
+                for c in range(final_k):
+                    mask = df['cluster'] == c
+                    ax.scatter(df.loc[mask, 'pca1'], df.loc[mask, 'pca2'], 
+                              c=colors[c], label=f'群体{c+1} ({describe_cluster(c)})', alpha=0.7, s=60)  # 从1开始计数
+                ax.set_xlabel(f'PC1 (解释方差：{pca.explained_variance_ratio_[0]:.2f})', fontsize=12)
+                ax.set_ylabel(f'PC2 (解释方差：{pca.explained_variance_ratio_[1]:.2f})', fontsize=12)
+                ax.legend(fontsize=10)
+                ax.grid(True, alpha=0.3)
+                st.pyplot(fig)
+
+                # 10. 患者明细
+                st.write("### 👥 患者分群明细")
+                display_cols = ['patient_id'] + st.session_state.selected_features + ['cluster', 'cluster_type', 'risk_level']
+                available_display = [c for c in display_cols if c in df.columns]
+                # 显示时群体编号+1，不改动原始数据
+                display_df = df[available_display].copy()
+                display_df['cluster'] = display_df['cluster'] + 1
+                st.dataframe(display_df.head(100))
+
+    # 新患者预测模块（独立于分析按钮，依赖会话状态）
+    if st.session_state.model is not None and st.session_state.scaler is not None:
+        st.write("### 🔍 新患者风险评估")
+
+        # 动态生成输入框（根据选择的特征）
+        input_cols = st.columns(len(st.session_state.selected_features))
+        new_patient_data = {}
+
+        # 特征默认值配置（更合理的医学默认值）
+        default_values = {
+            'age': 50.0, 'systolic_bp': 120.0, 'diastolic_bp': 80.0,
+            'heart_rate': 75.0, 'blood_sugar': 100.0, 'bmi': 24.0,
+            'cholesterol': 200.0
+        }
+
+        # 生成对应特征的输入框
+        for idx, feat in enumerate(st.session_state.selected_features):
+            with input_cols[idx]:
+                new_patient_data[feat] = st.number_input(
+                    feat.replace('_', ' ').title(),
+                    value=default_values.get(feat, 0.0),
+                    key=f"new_{feat}"
+                )
+
+        # 预测按钮
+        if st.button("预测风险"):
+            # 构造预测数据数组
+            new_data_array = np.array([[new_patient_data[feat] for feat in st.session_state.selected_features]])
+            # 使用保存的标准化器做转换（避免数据泄露）
+            new_data_scaled = st.session_state.scaler.transform(new_data_array)
+            # 预测聚类
+            pred_cluster = st.session_state.model.predict(new_data_scaled)[0]
+
+            # 生成预测结果
+            def get_cluster_desc(cid):
+                center = st.session_state.model.cluster_centers_[cid]
+                center_original = st.session_state.scaler.inverse_transform([center])[0]
+                features = []
+                feat_thresholds = {
+                    'age': (60, '高龄'),
+                    'systolic_bp': (140, '收缩压偏高'),
+                    'diastolic_bp': (90, '舒张压偏高'),
+                    'blood_sugar': (126, '血糖偏高'),
+                    'cholesterol': (240, '胆固醇偏高'),
+                    'heart_rate': (100, '心率偏快')
+                }
+                for i, feat in enumerate(st.session_state.selected_features):
+                    val = center_original[i]
+                    if feat == 'bmi':
+                        if val >= 29:
+                            features.append('肥胖')
+                        elif val >= 25:
+                            features.append('超重')
+                    elif feat in feat_thresholds and val >= feat_thresholds[feat][0]:
+                        features.append(feat_thresholds[feat][1])
+                return "、".join(features) + "群体" if features else "指标正常群体"
+
+            def get_risk_level(cid):
+                risk_score = np.mean(st.session_state.model.cluster_centers_[cid])
+                if risk_score > 0.5:
+                    return '高风险'
+                elif risk_score > -0.3:
+                    return '中风险'
+                else:
+                    return '低风险'
+
+            # 展示预测结果
+            st.success(f"""
+            ### 新患者风险预测结果
+            - 所属聚类群体：**群体{pred_cluster + 1}**
+            - 群体特征描述：**{get_cluster_desc(pred_cluster)}**
+            - 心血管风险等级：**{get_risk_level(pred_cluster)}**
+
+            #### 输入指标对比群体均值
+            | 特征 | 输入值 | 群体均值 |
+            |------|--------|----------|
+            {''.join([f'| {feat.replace('_', ' ').title()} | {new_patient_data[feat]:.1f} | {st.session_state.scaler.inverse_transform([st.session_state.model.cluster_centers_[pred_cluster]])[0][idx]:.1f} |\n' 
+                     for idx, feat in enumerate(st.session_state.selected_features)])}
+            """)
+else:
+    st.info("👈 请从左侧上传患者数据文件（CSV格式），支持的特征列：age, systolic_bp, diastolic_bp, heart_rate, blood_sugar, bmi, cholesterol")
+
+# ========== 修改后的AI问答模块（自动读取密钥，用户无需输入） ==========
+st.divider()
+st.header("🤖 AI智能健康数据分析问答助手")
+st.markdown("💡 你可以提问：指标解读、聚类分析、三高改善、健康生活建议等问题")
+
+# 自动从Streamlit Secrets读取密钥
+try:
+    api_key = st.secrets["ZHIPU_API_KEY"]
+except KeyError:
+    st.warning("⚠️ 管理员未配置API Key，AI问答暂时无法使用")
+    api_key = None
+
+# 只有配置了密钥才显示问答框
+if api_key:
+    user_question = st.text_input("请输入你的问题：", placeholder="例如：BMI28如何减脂、高血压饮食建议、聚类结果怎么解读")
+
+    if st.button("提问") and user_question.strip():
+        with st.spinner("AI正在分析你的问题..."):
+            import requests
+            url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+            # 固定AI角色，贴合你的心血管系统
+            system_prompt = """
+            你是心血管体检数据分析专业助手，严格遵守以下医学标准：
+            1. 高危阈值：年龄>60、收缩压≥140、舒张压≥90、空腹血糖≥126、BMI≥28、胆固醇≥240、心率>100；
+            2. 系统使用K-Means聚类自动划分患者风险群体，高风险=≥2项指标超标；
+            3. 回答简洁专业，分点给出生活改善方案，不做医疗诊断，只做健康科普；
+            4. 不要输出冗余内容，条理清晰。
+            """
+            payload = {
+                "model": "glm-4-flash",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_question}
+                ],
+                "temperature": 0.3
+            }
+            res = requests.post(url, headers=headers, json=payload)
+            if res.status_code == 200:
+                reply = res.json()["choices"][0]["message"]["content"]
+                st.success(f"🤖 AI回答：\n{reply}")
+            else:
+                st.error("AI调用失败，请稍后重试或联系管理员")
+# ======================================================================
+# 底部说明
+st.markdown("---")
+st.markdown("""
+**数据说明：**
+- 本系统使用的医学指标包括：年龄、收缩压、舒张压、心率、空腹血糖、体重指数（BMI）、总胆固醇
+- 风险判断参考标准（简化版，仅供算法演示）：
+  - 收缩压 ≥140mmHg 或 舒张压 ≥90mmHg：参考《中国高血压防治指南》
+  - 空腹血糖 ≥126mg/dL：参考美国糖尿病协会（ADA）标准
+  - BMI 25-28.99：超重；BMI ≥29：肥胖。参考《中国成人超重和肥胖预防控制指南》
+  - 总胆固醇 ≥240mg/dL：参考《中国成人血脂异常防治指南》
+
+**免责声明：** 本系统为K-Means无监督学习算法演示项目，使用的风险判断标准为简化版，仅用于教学和研究目的。不构成医学诊断或治疗建议，实际医疗决策请咨询专业医师。
+""")
